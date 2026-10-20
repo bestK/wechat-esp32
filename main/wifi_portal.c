@@ -542,9 +542,9 @@ static esp_err_t start_http(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
     cfg.stack_size = 8192;
-    // Default is 8. The portal uses 6 and hid_http adds 3 more; too few slots
+    // Default is 8. The portal uses 9 and hid_http adds 7 more; too few slots
     // silently fails registration with ESP_ERR_HTTPD_HANDLERS_FULL.
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 24;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd start failed");

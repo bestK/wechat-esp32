@@ -210,3 +210,95 @@ int hid_keyboard_send_line(const char *utf8)
     }
     return typed;
 }
+
+// ---- Mouse -----------------------------------------------------------------
+
+// Largest per-report step and the gap between reports. Each report is one
+// notification; sending faster than the connection interval (20-60 ms, see
+// ancs_client.c) only queues them, and a deep queue makes swipes jerky.
+#define MOUSE_STEP      20
+#define MOUSE_GAP_MS    15
+
+static int clamp_step(int v)
+{
+    return v > MOUSE_STEP ? MOUSE_STEP : v < -MOUSE_STEP ? -MOUSE_STEP : v;
+}
+
+// Move by (dx, dy) in small steps with the given buttons held throughout.
+// Returns the number of reports sent.
+static int mouse_path(int dx, int dy, uint8_t buttons)
+{
+    int reports = 0;
+    while ((dx || dy) && s_connected) {
+        int sx = clamp_step(dx);
+        int sy = clamp_step(dy);
+        esp_hidd_send_mouse_value(s_conn_id, buttons, (int8_t)sx, (int8_t)sy, 0);
+        dx -= sx;
+        dy -= sy;
+        reports++;
+        vTaskDelay(pdMS_TO_TICKS(MOUSE_GAP_MS));
+    }
+    return reports;
+}
+
+int hid_mouse_move(int dx, int dy)
+{
+    if (!s_connected) {
+        return 0;
+    }
+    return mouse_path(dx, dy, 0);
+}
+
+int hid_mouse_click(uint8_t buttons)
+{
+    if (!s_connected || !buttons) {
+        return 0;
+    }
+    esp_hidd_send_mouse_value(s_conn_id, buttons, 0, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(KEY_PRESS_MS * 5));
+    esp_hidd_send_mouse_value(s_conn_id, 0, 0, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(MOUSE_GAP_MS));
+    return 2;
+}
+
+int hid_mouse_swipe(int dx, int dy)
+{
+    if (!s_connected) {
+        return 0;
+    }
+    // Press, drag, release. iOS needs the press to settle before movement,
+    // otherwise the gesture is read as a pointer move rather than a drag.
+    esp_hidd_send_mouse_value(s_conn_id, HID_BTN_LEFT, 0, 0, 0);
+    vTaskDelay(pdMS_TO_TICKS(MOUSE_GAP_MS * 3));
+    int reports = 1 + mouse_path(dx, dy, HID_BTN_LEFT);
+    vTaskDelay(pdMS_TO_TICKS(MOUSE_GAP_MS * 3));
+    esp_hidd_send_mouse_value(s_conn_id, 0, 0, 0, 0);
+    return reports + 1;
+}
+
+int hid_mouse_scroll(int clicks)
+{
+    int reports = 0;
+    while (clicks && s_connected) {
+        int8_t step = clicks > 0 ? 1 : -1;
+        esp_hidd_send_mouse_value(s_conn_id, 0, 0, 0, step);
+        clicks -= step;
+        reports++;
+        vTaskDelay(pdMS_TO_TICKS(MOUSE_GAP_MS * 2));
+    }
+    return reports;
+}
+
+// ---- Consumer (media) keys -------------------------------------------------
+
+int hid_media_key(uint16_t bits)
+{
+    if (!s_connected || !bits) {
+        return 0;
+    }
+    esp_hidd_send_consumer_bits(s_conn_id, bits);
+    vTaskDelay(pdMS_TO_TICKS(KEY_PRESS_MS * 5));
+    esp_hidd_send_consumer_bits(s_conn_id, 0);
+    vTaskDelay(pdMS_TO_TICKS(KEY_GAP_MS));
+    return 1;
+}

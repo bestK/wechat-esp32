@@ -156,11 +156,26 @@ esp_err_t esp_hidd_profile_deinit(void);
  */
 uint16_t esp_hidd_get_version(void);
 
-void esp_hidd_send_consumer_value(uint16_t conn_id, uint8_t key_cmd, bool key_pressed);
+// Consumer control bits, in the order declared by the report map.
+#define HID_CC_VOLUME_UP        (1u << 0)
+#define HID_CC_VOLUME_DOWN      (1u << 1)
+#define HID_CC_MUTE             (1u << 2)
+#define HID_CC_PLAY_PAUSE       (1u << 3)
+#define HID_CC_NEXT_TRACK       (1u << 4)
+#define HID_CC_PREV_TRACK       (1u << 5)
+#define HID_CC_BRIGHTNESS_UP    (1u << 6)
+#define HID_CC_BRIGHTNESS_DOWN  (1u << 7)
+#define HID_CC_AC_HOME          (1u << 8)
+#define HID_CC_AC_SEARCH        (1u << 9)
+#define HID_CC_AC_BACK          (1u << 10)
+#define HID_CC_KEYBOARD_TOGGLE  (1u << 11)
+
+// Send the consumer bitmap; pass 0 to release all keys.
+void esp_hidd_send_consumer_bits(uint16_t conn_id, uint16_t bits);
 
 void esp_hidd_send_keyboard_value(uint16_t conn_id, key_mask_t special_key_mask, uint8_t *keyboard_cmd, uint8_t num_key);
 
-void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mickeys_x, int8_t mickeys_y);
+void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mickeys_x, int8_t mickeys_y, int8_t wheel);
 
 #ifdef __cplusplus
 }

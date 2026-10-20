@@ -3,11 +3,11 @@
 ESP32-S3 同时承担三件事：
 
 - 通过 Apple ANCS 接收 iPhone 系统通知，过滤微信（`com.tencent.xin`）后输出到串口
-- 作为 BLE HID 键盘，可由 HTTP 接口驱动向手机输入文字
+- 作为 BLE HID 键盘 + 鼠标 + 媒体键，可由 HTTP 接口驱动向手机输入文字、滑动、点击
 - 提供 SoftAP 配网热点与 HTTP 控制接口
 
-ANCS 已在 ESP32-S3（16 MB flash）与 iPhone 上验证；HID 键盘已在 Windows 10
-上验证（主机收到的按键与发送内容一致），iPhone 端输入尚未实机确认。
+ANCS 已在 ESP32-S3（16 MB flash）与 iPhone 上验证；HID 键盘、鼠标、媒体键已在
+Windows 10 上验证（主机收到的输入与请求一致），iPhone 端尚未实机确认。
 
 ## 工作原理
 
@@ -72,12 +72,31 @@ I (31972) app: =============================================
 | GET | `/hid/status` | `{"connected":true}` 表示已有 HID 主机 |
 | GET | `/hid/type?text=...` | 输入文字，返回按键数；仅支持 US 布局 ASCII，含非 ASCII 返回 400 |
 | GET | `/hid/line?text=...` | 同上，末尾追加回车 |
+| GET | `/hid/mouse?dx=&dy=&click=` | 相对移动，可选 `click=left\|right\|middle`；`dx`/`dy` 范围 ±4000 |
+| GET | `/hid/swipe?dir=&dist=` | 单指滑动：按住左键拖动后松开；`dir=up\|down\|left\|right`，`dist` 默认 300；也可用 `dx`/`dy` |
+| GET | `/hid/scroll?n=` | 滚轮，正数向上，范围 ±50 |
+| GET | `/hid/key?name=` | 媒体键：`home` `search` `back` `keyboard` `volup` `voldown` `mute` `play` `next` `prev` `brightup` `brightdown` |
+
+HID 接口返回发送的报告数；未连接 HID 主机时返回 409，参数错误返回 400。
 
 ```bash
 curl -X POST http://192.168.4.1/api/wifi -H "Content-Type: application/json" \
      -d '{"ssid":"MyWiFi","password":"secret"}'
 curl "http://192.168.4.1/hid/line?text=hello"
+curl "http://192.168.4.1/hid/swipe?dir=up&dist=400"
+curl "http://192.168.4.1/hid/key?name=home"
 ```
+
+### iPhone 上的鼠标与手势
+
+- 鼠标指针需开启「设置 → 辅助功能 → 触控 → 辅助触控」，否则 iOS 不显示指针、
+  不响应点击与拖动。媒体键不需要。
+- 鼠标是相对坐标，设备不知道指针位置。需要定位时先用大负值把指针推到左上角
+  （如 `dx=-3000&dy=-3000`）再移动。iOS 指针速度设置会影响实际移动距离。
+- `home` 对应 AC Home（回主屏幕），`search` 对应 AC Search（Spotlight），
+  `keyboard` 对应 AL Keyboard Layout（切换屏幕键盘）。
+- 只能模拟单指操作。双指缩放等多点手势需要触摸屏（digitizer）报告，iOS 不接受
+  外接触摸屏输入。
 
 恢复出厂（清除 WiFi 配置）：运行中长按 BOOT 5 秒，或 5 秒内连按 RST 3 次。
 
@@ -92,7 +111,7 @@ wechat-esp32/
 │   ├── ancs_client.c     ANCS GATT 客户端
 │   ├── ancs_client.h     接口与通知结构体
 │   ├── hid/              ESP-IDF HID device profile（HOGP）
-│   ├── hid_keyboard.c    BLE HID 键盘：ASCII → HID usage
+│   ├── hid_keyboard.c    BLE HID 键盘、鼠标、媒体键
 │   ├── hid_http.c        /hid/* HTTP 接口
 │   ├── wifi_portal.c     SoftAP 配网页面与 /api/* 接口
 │   ├── reset_button.c    BOOT 长按 / RST 连按恢复出厂
@@ -167,11 +186,23 @@ ESP-IDF 示例中 HID 服务声明的权限为 `ESP_GATT_PERM_READ_ENCRYPTED`，
 Windows 配对后若仍无 HID 设备，重新发现一次 GATT 服务（如重新连接）即可触发
 `HID\{00001812-...}` 节点创建。
 
+### 示例 HID profile 的几处修改
+
+- 媒体键：示例的消费者控制集合编码复杂且没有 AC Home / AC Search，改为 12 位
+  位图（加 4 位填充），每个键一位，见 `esp_hidd_prf_api.h` 中的 `HID_CC_*`。
+- 鼠标报告：描述符声明 4 字节（按键、X、Y、滚轮），示例实际发送 5 字节，
+  已改为 4 字节，并开放滚轮参数。
+- `hid_dev.h` 定义了 `HID_MOUSE_LEFT = 253`（示例内部命令码，不是按键位），
+  与按键位掩码同名会互相覆盖，导致左键拖动同时按下中键。按键位改名为 `HID_BTN_*`。
+
+修改报告描述符后，主机会沿用缓存的旧描述符：Windows 需删除设备重新配对，
+iPhone 需在蓝牙设置中「忽略此设备」后重新配对。
+
 ### httpd 默认只有 8 个 URI handler
 
-配网页与 `/api/*` 共 9 个 handler，再加 `/hid/*` 3 个，超出默认值后
+配网页与 `/api/*` 共 9 个 handler，再加 `/hid/*` 7 个，超出默认值后
 `httpd_register_uri_handler()` 返回 `ESP_ERR_HTTPD_HANDLERS_FULL`，只打日志、不影响
-启动，后注册的接口返回 404。`start_http()` 中设置 `cfg.max_uri_handlers = 16`。
+启动，后注册的接口返回 404。`start_http()` 中设置 `cfg.max_uri_handlers = 24`。
 
 ### STA 重连需要上限
 
@@ -201,7 +232,7 @@ W (43519) BT_SMP: FOR LE SC LTK IS USED INSTEAD OF STK
 
 ### HID
 
-- 在 iPhone 上确认输入（需停留在文本框内）
+- 在 iPhone 上确认输入（需停留在文本框内）、滑动与媒体键效果，校准 `dist` 与屏幕距离的比例
 - 中文输入：HID 只能发送 usage id，需借助剪贴板或输入法方案
 
 ### RPA

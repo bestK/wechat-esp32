@@ -17,8 +17,9 @@
 // HID LED output report length
 #define HID_LED_OUT_RPT_LEN         1
 
-// HID mouse input report length
-#define HID_MOUSE_IN_RPT_LEN        5
+// HID mouse input report length: buttons, X, Y, wheel. The example sent a
+// fifth (AC Pan) byte the report map never declared.
+#define HID_MOUSE_IN_RPT_LEN        4
 
 // HID consumer control input report length
 #define HID_CC_IN_RPT_LEN           2
@@ -84,14 +85,9 @@ uint16_t esp_hidd_get_version(void)
 	return HIDD_VERSION;
 }
 
-void esp_hidd_send_consumer_value(uint16_t conn_id, uint8_t key_cmd, bool key_pressed)
+void esp_hidd_send_consumer_bits(uint16_t conn_id, uint16_t bits)
 {
-    uint8_t buffer[HID_CC_IN_RPT_LEN] = {0, 0};
-    if (key_pressed) {
-        ESP_LOGD(HID_LE_PRF_TAG, "hid_consumer_build_report");
-        hid_consumer_build_report(buffer, key_cmd);
-    }
-    ESP_LOGD(HID_LE_PRF_TAG, "buffer[0] = %x, buffer[1] = %x", buffer[0], buffer[1]);
+    uint8_t buffer[HID_CC_IN_RPT_LEN] = { bits & 0xFF, bits >> 8 };
     hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
                         HID_RPT_ID_CC_IN, HID_REPORT_TYPE_INPUT, HID_CC_IN_RPT_LEN, buffer);
     return;
@@ -118,15 +114,14 @@ void esp_hidd_send_keyboard_value(uint16_t conn_id, key_mask_t special_key_mask,
     return;
 }
 
-void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mickeys_x, int8_t mickeys_y)
+void esp_hidd_send_mouse_value(uint16_t conn_id, uint8_t mouse_button, int8_t mickeys_x, int8_t mickeys_y, int8_t wheel)
 {
     uint8_t buffer[HID_MOUSE_IN_RPT_LEN];
 
     buffer[0] = mouse_button;   // Buttons
-    buffer[1] = mickeys_x;           // X
-    buffer[2] = mickeys_y;           // Y
-    buffer[3] = 0;           // Wheel
-    buffer[4] = 0;           // AC Pan
+    buffer[1] = mickeys_x;      // X
+    buffer[2] = mickeys_y;      // Y
+    buffer[3] = wheel;          // Wheel
 
     hid_dev_send_report(hidd_le_env.gatt_if, conn_id,
                         HID_RPT_ID_MOUSE_IN, HID_REPORT_TYPE_INPUT, HID_MOUSE_IN_RPT_LEN, buffer);
