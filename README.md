@@ -143,6 +143,37 @@ W (43519) BT_SMP: FOR LE SC LTK IS USED INSTEAD OF STK
 
 **仅处理 `EventID = Added`。** 通知修改与撤回事件被忽略。
 
+## 待办
+
+### HID
+
+将设备注册为蓝牙键盘，用于回复微信。需要 Classic BT：
+
+```ini
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BT_HID_ENABLED=y
+CONFIG_BT_HID_DEVICE_ENABLED=y
+```
+
+`BT_HID_DEVICE_ENABLED` 依赖 `BT_CLASSIC_ENABLED`，启用后需重新评估内存占用
+（当前配置为 BLE-only，并调用了 `esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT)`）。
+ANCS 与 HID 可同时工作，但 Classic BT 与 BLE 共存会影响连接间隔稳定性。
+
+### RPA
+
+启用可解析私有地址，避免设备 MAC 固定暴露：
+
+```ini
+CONFIG_BT_BLE_RPA_SUPPORTED=y
+CONFIG_BT_BLE_RPA_TIMEOUT=900
+```
+
+并在初始化时调用 `esp_ble_gap_config_local_privacy(true)`，广播参数改用
+`BLE_ADDR_TYPE_RPA_PUBLIC`。
+
+需要注意：RPA 与当前绑定关系绑定于 IRK。更换地址类型后，iPhone 侧需要删除
+旧配对记录并重新绑定，否则 `ESP_GAP_BLE_AUTH_CMPL_EVT` 会失败。
+
 ## 调试
 
 `tools/ancs_wechat.py` 使用 `bleak` 在 Windows 上实现同一 ANCS 客户端，
