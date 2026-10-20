@@ -1,0 +1,31 @@
+# ESP32-S3, BLE-only, acting as an ANCS client (a "watch").
+CONFIG_IDF_TARGET="esp32s3"
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+# The chip reports 16 MB (the devkit board definition assumes 8 MB N8).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Bluetooth: Bluedroid, BLE only.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_GATTC_ENABLE=y
+# Kept on: Bluedroid only registers the GAP service when the server role is
+# compiled in, and iOS expects to find it on the peripheral it connects to.
+CONFIG_BT_GATTS_ENABLE=y
+CONFIG_BT_BLE_SMP_ENABLE=y
+
+# esp_ble_gattc_open() lives behind the 4.2 feature flag, and on the ESP32-S3
+# the 5.0 feature flag defaults to on. They are mutually exclusive in Bluedroid.
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
+
+# ANCS needs a few characteristics cached per peer (3 services + descriptors).
+CONFIG_BT_GATTC_MAX_CACHE_CHAR=40
