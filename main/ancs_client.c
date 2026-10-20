@@ -22,10 +22,10 @@
 #include "esp_gap_ble_api.h"
 #include "esp_gatt_common_api.h"
 #include "esp_gattc_api.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nvs.h"
 
 static const char *TAG = "ancs";
 
@@ -65,9 +65,13 @@ static const uint8_t ANCS_DATA_SOURCE_UUID[16] = {
 #define ANCS_REASM_MAX     1024
 
 #define ADV_TYPE_FLAGS         0x01
+#define ADV_TYPE_UUID16        0x03
 #define ADV_TYPE_NAME          0x09
 #define ADV_TYPE_SOL_UUID128   0x15
 #define ADV_FLAGS              0x06
+
+// HID over GATT service, advertised as a 16-bit UUID.
+#define HID_SERVICE_UUID       0x1812
 
 static ancs_notify_cb_t s_cb;
 static void *s_cb_ctx;
@@ -93,36 +97,40 @@ static uint16_t s_data_source_handle;
 static uint8_t s_reasm[ANCS_REASM_MAX];
 static size_t s_reasm_len;
 
-// iPhone can push several notifications back to back, so one pending slot is
-// not enough: remember the category per UID until its attributes come back.
-#define ANCS_PENDING_MAX 8
+// iPhone replays the whole Notification Centre at once on reconnect: 15
+// notifications arrived within 65 ms in testing, while the attribute replies
+// only started ~1.3 s later. The table must therefore be larger than any
+// realistic burst, or entries get evicted before they are consumed.
+#define ANCS_PENDING_MAX 32
 typedef struct {
     uint32_t uid;
     uint8_t category;
     bool used;
 } ancs_pending_t;
 static ancs_pending_t s_pending[ANCS_PENDING_MAX];
+static int s_pending_next;    // Eviction cursor used only when the table is full.
 
 static void remember_category(uint32_t uid, uint8_t category)
 {
+    int free_slot = -1;
     for (int i = 0; i < ANCS_PENDING_MAX; ++i) {
         if (s_pending[i].used && s_pending[i].uid == uid) {
             s_pending[i].category = category;
             return;
         }
-    }
-    for (int i = 0; i < ANCS_PENDING_MAX; ++i) {
-        if (!s_pending[i].used) {
-            s_pending[i].used = true;
-            s_pending[i].uid = uid;
-            s_pending[i].category = category;
-            return;
+        if (!s_pending[i].used && free_slot < 0) {
+            free_slot = i;
         }
     }
-    // Table full: reuse slot 0. Only the category label is lost.
-    s_pending[0].used = true;
-    s_pending[0].uid = uid;
-    s_pending[0].category = category;
+    if (free_slot < 0) {
+        // Still full: drop the oldest entry rather than a fixed slot, so a
+        // long burst degrades gracefully instead of losing the newest.
+        free_slot = s_pending_next;
+        s_pending_next = (s_pending_next + 1) % ANCS_PENDING_MAX;
+    }
+    s_pending[free_slot].used = true;
+    s_pending[free_slot].uid = uid;
+    s_pending[free_slot].category = category;
 }
 
 static uint8_t take_category(uint32_t uid, bool *found)
@@ -142,32 +150,27 @@ static uint8_t take_category(uint32_t uid, bool *found)
 // ---- Duplicate suppression ------------------------------------------------
 //
 // iOS replays every notification still sitting in Notification Centre each time
-// we reconnect, so the same UID arrives again after every reboot. Remember the
-// last few notifications in NVS and skip repeats.
+// a connection is established. Within one connection the same content is
+// therefore a replay and gets dropped.
 //
-// UID alone is not enough: iOS may reuse a UID for a different message once the
-// original is dismissed. Pairing the UID with a hash of the text keeps a reused
-// UID with new content from being swallowed.
+// This is deliberately session-scoped, not persisted:
+//  - UID is not stable across connections. iOS renumbers from 0 on reconnect,
+//    so "uid 0 + same text" after a reconnect is a different message.
+//  - Uptime does not survive a reboot, so timestamps stored in NVS would make
+//    every notification after reboot look like a fresh replay.
+// A message repeated by the sender later in the same session is still shown,
+// because the window below is short.
 
-#define DEDUP_NS        "ancs"
-#define DEDUP_KEY       "seen"
-#define DEDUP_MAX       16
+#define DEDUP_MAX         16
+#define DEDUP_WINDOW_SEC  10      // Replays arrive within a second or two.
 
 typedef struct {
-    uint32_t uid;
     uint32_t text_hash;   // FNV-1a over app_id + title + message.
+    uint32_t when;        // Uptime seconds when it was delivered.
     bool valid;
 } dedup_entry_t;
 
-typedef struct {
-    uint32_t magic;       // Bumped when the layout changes.
-    dedup_entry_t entries[DEDUP_MAX];
-} dedup_store_t;
-
-#define DEDUP_MAGIC 0x414E4353u   // "ANCS"
-
-static dedup_store_t s_seen;
-static bool s_seen_loaded;
+static dedup_entry_t s_seen[DEDUP_MAX];
 static size_t s_seen_next;        // Round-robin insert position.
 
 static uint32_t notification_hash(const ancs_notification_t *n)
@@ -187,60 +190,41 @@ static uint32_t notification_hash(const ancs_notification_t *n)
     return h;
 }
 
-static void dedup_load(void)
+static uint32_t now_sec(void)
 {
-    if (s_seen_loaded) {
-        return;
-    }
-    s_seen_loaded = true;
-
-    nvs_handle_t nvs;
-    if (nvs_open(DEDUP_NS, NVS_READONLY, &nvs) != ESP_OK) {
-        return;                       // Nothing stored yet.
-    }
-    size_t len = sizeof(s_seen);
-    esp_err_t err = nvs_get_blob(nvs, DEDUP_KEY, &s_seen, &len);
-    nvs_close(nvs);
-    if (err != ESP_OK || len != sizeof(s_seen) || s_seen.magic != DEDUP_MAGIC) {
-        memset(&s_seen, 0, sizeof(s_seen));
-        s_seen.magic = DEDUP_MAGIC;
-    }
+    return (uint32_t)(esp_timer_get_time() / 1000000);
 }
 
-static void dedup_save(void)
+// Returns true when the same content was delivered within DEDUP_WINDOW_SEC.
+static bool dedup_seen(uint32_t text_hash)
 {
-    nvs_handle_t nvs;
-    if (nvs_open(DEDUP_NS, NVS_READWRITE, &nvs) != ESP_OK) {
-        return;
-    }
-    nvs_set_blob(nvs, DEDUP_KEY, &s_seen, sizeof(s_seen));
-    nvs_commit(nvs);
-    nvs_close(nvs);
-}
-
-// Returns true when this notification was already delivered before.
-static bool dedup_seen(uint32_t uid, uint32_t text_hash)
-{
-    dedup_load();
+    uint32_t now = now_sec();
     for (int i = 0; i < DEDUP_MAX; ++i) {
-        if (s_seen.entries[i].valid &&
-            s_seen.entries[i].uid == uid &&
-            s_seen.entries[i].text_hash == text_hash) {
+        if (!s_seen[i].valid || s_seen[i].text_hash != text_hash) {
+            continue;
+        }
+        // Unsigned subtraction stays correct across the 32-bit wrap.
+        if ((uint32_t)(now - s_seen[i].when) <= DEDUP_WINDOW_SEC) {
             return true;
         }
     }
     return false;
 }
 
-static void dedup_remember(uint32_t uid, uint32_t text_hash)
+static void dedup_remember(uint32_t text_hash)
 {
-    dedup_load();
-    dedup_entry_t *slot = &s_seen.entries[s_seen_next];
-    slot->uid = uid;
+    dedup_entry_t *slot = &s_seen[s_seen_next];
     slot->text_hash = text_hash;
+    slot->when = now_sec();
     slot->valid = true;
     s_seen_next = (s_seen_next + 1) % DEDUP_MAX;
-    dedup_save();
+}
+
+// A new connection replays the whole Notification Centre, so start clean.
+static void dedup_reset(void)
+{
+    memset(s_seen, 0, sizeof(s_seen));
+    s_seen_next = 0;
 }
 
 static char s_name[32] = "WeChat-Watch";
@@ -447,11 +431,11 @@ static void on_data_source(const uint8_t *data, uint16_t len)
     };
 
     uint32_t hash = notification_hash(&n);
-    if (dedup_seen(uid, hash)) {
-        ESP_LOGD(TAG, "skipping replayed notification uid=%lu", (unsigned long)uid);
+    if (dedup_seen(hash)) {
+        ESP_LOGI(TAG, "skipping replayed notification uid=%lu", (unsigned long)uid);
         return;
     }
-    dedup_remember(uid, hash);
+    dedup_remember(hash);
 
     if (s_cb) {
         s_cb(&n, s_cb_ctx);
@@ -539,6 +523,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         }
         s_conn_id = param->open.conn_id;
         s_have_conn = true;
+        dedup_reset();
         ESP_LOGI(TAG, "gattc open, conn=%u", s_conn_id);
 
         // iPhone only exposes ANCS over an encrypted, bonded link.
@@ -622,6 +607,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
         s_notif_source_handle = s_control_point_handle = s_data_source_handle = 0;
         s_reasm_len = 0;
         memset(s_pending, 0, sizeof(s_pending));
+        s_pending_next = 0;
         esp_ble_gap_start_advertising(&s_adv_params);
         break;
 
@@ -698,6 +684,15 @@ static void build_adv(void)
     s_adv[off++] = ADV_TYPE_SOL_UUID128;
     memcpy(s_adv + off, ANCS_SERVICE_UUID, 16);
     off += 16;
+
+    // Advertise the HID service too, so the iPhone treats us as a keyboard and
+    // offers the on-screen typing UI. 16-bit form costs 4 bytes; the 128-bit
+    // form would not fit next to the ANCS solicitation.
+    s_adv[off++] = 1 + 2;
+    s_adv[off++] = ADV_TYPE_UUID16;
+    s_adv[off++] = HID_SERVICE_UUID & 0xff;
+    s_adv[off++] = (HID_SERVICE_UUID >> 8) & 0xff;
+
     s_adv_len = off;
 
     size_t name_len = strlen(s_name);
@@ -751,7 +746,9 @@ esp_err_t ancs_client_init(ancs_notify_cb_t cb, void *ctx)
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &key_mask, sizeof(key_mask));
 
     esp_ble_gap_set_device_name(s_name);
-    esp_ble_gap_config_local_icon(ESP_BLE_APPEARANCE_GENERIC_WATCH);
+    // The HID profile sets APPEARANCE_GENERIC_HID from its GATTS REG_EVT, so
+    // the watch appearance is applied there instead: an iOS device offers the
+    // keyboard UI based on the HID service, not the appearance value.
 
     err = esp_ble_gatt_set_local_mtu(517);
     if (err != ESP_OK) {

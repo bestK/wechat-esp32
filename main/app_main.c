@@ -9,6 +9,10 @@
 #include "nvs_flash.h"
 
 #include "ancs_client.h"
+#include "hid_keyboard.h"
+#include "hid_http.h"
+#include "reset_button.h"
+#include "wifi_portal.h"
 
 static const char *TAG = "app";
 
@@ -82,7 +86,20 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    // Must run before the portal decides whether to use the saved network.
+    ESP_ERROR_CHECK(reset_button_init());
+
+    // Three quick RST taps: erase credentials now that NVS is available.
+    if (reset_button_factory_reset_requested()) {
+        wifi_portal_forget();       // Erases NVS and restarts; does not return.
+    }
+
     ESP_ERROR_CHECK(bt_stack_init());
+
+    // HID first: it registers the GATTS callback and its own GATT apps, and
+    // sets the HID appearance. ANCS is a GATTC client and does not touch either.
+    ESP_ERROR_CHECK(hid_keyboard_init());
+    ESP_ERROR_CHECK(hid_keyboard_start());
 
     ancs_client_set_name("WeChat-Watch");
     ESP_ERROR_CHECK(ancs_client_init(on_notification, NULL));
@@ -90,18 +107,26 @@ void app_main(void)
 
     ESP_LOGI(TAG, "pair from iPhone Settings > Bluetooth, then lock the phone and send a WeChat message");
 
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if (ancs_client_ready()) {
-            ESP_LOGI(TAG, "connected and subscribed");
-            break;
+    reset_button_start_monitor();
+
+    // Wi-Fi portal: open AP first, then the web page joins the LAN.
+    esp_err_t wifi_err = wifi_portal_start();
+    if (wifi_err == ESP_OK) {
+        if (hid_http_start() != ESP_OK) {
+            ESP_LOGW(TAG, "HID control endpoints unavailable");
         }
+        ESP_LOGI(TAG, "join the \"%s\" hotspot, then open http://192.168.4.1/",
+                 WIFI_PORTAL_AP_SSID);
+    } else {
+        ESP_LOGW(TAG, "wifi portal failed: %s", esp_err_to_name(wifi_err));
     }
 
-    // Nothing else to do: the ANCS callback task drives everything from here.
+    // Nothing else to do: the ANCS, HID and Wi-Fi callbacks drive everything.
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
-        ESP_LOGI(TAG, "alive (connected=%d ready=%d)",
-                 ancs_client_connected(), ancs_client_ready());
+        ESP_LOGI(TAG, "alive (ancs=%d/%d hid=%d wifi=%s)",
+                 ancs_client_connected(), ancs_client_ready(),
+                 hid_keyboard_connected(),
+                 wifi_portal_sta_connected() ? wifi_portal_sta_ip() : "offline");
     }
 }
